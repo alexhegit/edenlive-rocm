@@ -1,0 +1,5 @@
+
+11/06 08:11:21 | INFO    | r00 | edenlive.models.adapters.wan22_diffusers.teacher_forcing_attention:66 | Wan teacher-forcing self-attention backend: triton
+
+11/06 08:11:23 | INFO    | r00 | edenlive.models.adapters.wan22_diffusers.adapter:448 | Wan transformer components loaded: ('transformer',)
+PYTHON_EXIT=0
