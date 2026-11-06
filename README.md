@@ -5,20 +5,42 @@ few-step (chunk-autoregressive) inference path.
 
 ## What works on MI300X
 
-`wan22_5b_720p_few_step.yaml` — 1280×704, 717 frames, 4-step chunk-AR.
-Full pipeline on a single MI300X (192 GB VRAM, ROCm 7.2.4, torch
+### 5B — `wan22_5b_720p_few_step.yaml` (Wan2.2-TI2V-5B @ 720p)
+
+1280×704, 717 frames, 4-step chunk-AR. Full pipeline on a single MI300X
+(192 GB VRAM, ROCm 7.2.4, torch
 2.10.0+rocm7.2.4, container
 `rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0`):
 
 - Data loading (av + decord, recording_manifest dataset) ✅
-- Wan2.2-TI2V-5B DiT + Wan VAE + UMT5 + proxy-DINOv3 encoder load ✅
+- 5B DiT + Wan VAE + UMT5 + proxy-DINOv3 encoder load ✅
 - `teacher_forcing_attention_backend: triton` path ✅
   (this is `dispatch_attention_fn(backend=None)` = native/SDPA flash
   attention; the FA4/CuTe path is *not* touched)
 - 2× sample generate + VAE decode + libx264 encode ✅
-  (measured ~115 s per 717-frame clip end-to-end incl. data prep + save)
+  (measured ~115-150 s per 717-frame clip end-to-end incl. data prep + save)
 - Outputs saved to `inference/wan22_5b_720p_few_step/save/inference/base/`
   (`<id>.mp4`, `<id>_proxy.mp4`, `<id>_image.png`, `<id>_prompt.txt`) ✅
+
+### 14B — `wan21_14b_480p_few_step.yaml` (Wan2.1-I2V-14B @ 480p)  ✅ verified 2026-11-05
+
+832×720, 477 frames, 4-step chunk-AR, **single MI300X card** (official config
+asks for 2-GPU sequence parallel + FSDP2; both disabled via CLI overrides):
+
+```
+inference.max_batches=1 runtime.fsdp2.enabled=false runtime.sequence_parallel.size=1
+DIFFUSERS_ATTN_BACKEND=_native_flash   # required: must be set BEFORE python starts
+```
+
+- Extra components vs 5B: **CLIP ViT-H/14 image encoder/processor** (Wan2.1
+  I2V needs it), `scheduler-14b` (scheduler_config.json, a few KB — easy to
+  forget in the downloads, `FileNotFoundError` at load if missing)
+- 62 GB DiT bf16 + 2.7 GB VAE + 11 GB UMT5 + CLIP → peak VRAM **~115 GB**,
+  fits one 192 GB card with plenty of headroom for KV cache + activations ✅
+- generate 477 frames @480p, ~6 min end-to-end, `PYTHON_EXIT=0`, content
+  verified (per-channel std 44, frame-to-frame diff 97) ✅
+- One benign warning: `torch.rms_norm` dtype mismatch (fp32 input vs bf16
+  weight) — numerical path, not a failure.
 
 Measured throughput ≈ 717 frames / 115 s ≈ **6.2 FPS** end-to-end
 (data + encode included). DiT-only would be higher. This is far below the
@@ -38,7 +60,7 @@ Measured throughput ≈ 717 frames / 115 s ≈ **6.2 FPS** end-to-end
 | Component | Why |
 |---|---|
 | `wan22_5b_720p_bidir.yaml` | `teacher_forcing_attention_backend: flash4` → `flash-attn-4==4.0.0b31` (CuTe, SM90/Hopper only). `validate_flash4_environment` explicitly requires `torch.cuda.get_device_capability == (9, 0)`. gfx90a is (9,0) **in a different axis** but the wheel isn't built for ROCm. |
-| `wan21_14b_480p_bidir/few_step` | Same FA4 requirement on bidir; few-step path uses triton and *might* work on 14B with 2-GPU sequence parallel, but 14B weights are not downloaded and it's an untested matrix of changes. |
+| `wan21_14b_480p_bidir` | Same FA4 requirement as the 5B bidir config. (The 14B **few-step** config does NOT need FA4 and was verified working on one MI300X — see table above.) |
 | `realtime/` WebRTC service | `flashdreams`/`apps/cam2v` + LightX2V accelerated decode — no ROCm path. |
 | `reactor/` (B200) | Runs on 1× B200 by design. |
 | `flux-c2f/` first-frame renderer | FLUX.2 non-commercial, workbench-only. Irrelevant for offline rendering. |
@@ -95,6 +117,25 @@ docker exec -e HIP_VISIBLE_DEVICES=0 edenlive-rocm bash -lc "
 
 Outputs → `inference/wan22_5b_720p_few_step/save/inference/base/<id>.mp4`.
 
+**14B @ 480p (single card, verified):**
+
+```bash
+docker exec -e HIP_VISIBLE_DEVICES=0 -e DIFFUSERS_ATTN_BACKEND=_native_flash edenlive-rocm bash -lc "
+  cd /mnt/doscratch/EdenLive && \
+  python -X faulthandler -u -m edenlive.scripts.infer \
+    --config edenlive/configs/wan21_14b_480p_few_step.yaml \
+    data.dataset.params.path=examples/samples/manifest.csv \
+    data.dataset.params.root=examples/samples \
+    inference.max_batches=1 \
+    runtime.fsdp2.enabled=false \
+    runtime.sequence_parallel.size=1"
+```
+
+Note `DIFFUSERS_ATTN_BACKEND=_native_flash` is mandatory for this config
+(`runtime.attention_backend.backend: _native_flash`) and must be set in the
+process environment *before* python starts — the plugin refuses a post-start
+switch. Outputs → `inference/wan21_14b_480p_few_step/save/inference/base/<id>.mp4`.
+
 ## Pitfalls we hit (keep these when extending)
 
 1. **`hf download --include a b c`** is interpreted as "explicit filenames are
@@ -128,6 +169,23 @@ Outputs → `inference/wan22_5b_720p_few_step/save/inference/base/<id>.mp4`.
    FLUX non-commercial.** We skipped it; the offline video pipeline does
    not load it (confirmed by `patch_wan_transformer_forward` + adapter code
    paths). Do not ship a "run the whole workbench" story under Apache 2.0.
+8. **`DIFFUSERS_ATTN_BACKEND` must be set before python starts.** The
+   `AttentionBackendPlugin` refuses any mismatch between the config's
+   `runtime.attention_backend.backend` (14B few-step says `_native_flash`)
+   and `os.environ.setdefault` value. The 5B config has
+   `attention_backend.enabled: false` so the env var is NOT required — do
+   not copy the 14B launch form onto the 5B run (it still works there, but
+   the env-var name `_native_flash` is a diffusers *internal* alias for the
+   SDPA flash kernel and is not documented by AMD as a stable ROCm setting;
+   treat it as "native SDPA flash" and re-check after a diffusers version
+   bump).
+9. **`scheduler-14b/scheduler_config.json` is a few-KB file** — it is easy to
+   forget when doing per-directory `hf download --include`. The pipeline
+   build dies immediately with a `FileNotFoundError` at the components
+   stage. Verify every components list in the model config against the
+   filesystem before running a big job (one-liner in the container:
+   `ls models/EdenLive/<path>` for each line of the config's
+   `components:` block).
 
 ## What would be needed to go faster on MI300X (future, out of scope)
 

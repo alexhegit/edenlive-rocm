@@ -48,6 +48,14 @@ done
 # that looks complete but misses diffusion_pytorch_model.safetensors).
 run "test -s ./models/EdenLive/dit-5b/diffusion_pytorch_model.safetensors"
 
+# 3b) Optional: 14B @ 480p few-step (~65 GB extra: dit-14b 62 GB + vae-14b,
+#     CLIP ViT-H/14 image encoder for Wan2.1-I2V + scheduler-14b).
+#     Verified working on a single MI300X (peak VRAM ~115 GB).
+for f in 'dit-14b/*' 'vae-14b/*' 'clip/*' 'scheduler-14b/*'; do
+  run "pip install -q huggingface_hub && hf download VAST-AI/EdenLive --local-dir ./models/EdenLive --include '$f'"
+done
+run "test -s ./models/EdenLive/dit-14b/diffusion_pytorch_model.safetensors"
+
 echo "==================================================================="
 echo "Environment ready. Run the ROCm-validated offline path:"
 echo
@@ -57,7 +65,7 @@ echo "  data.dataset.params.path=examples/samples/manifest.csv \\"
 echo "  data.dataset.params.root=examples/samples\""
 echo
 echo "Known boundaries (not runnable here):"
-echo "  - *bidir* configs require flash-attn-4 (SM90/Hopper) + nvidia-cutlass-dsl; CUDA-only."
-echo "  - 14B bidir 480p needs 2-GPU sequence parallelism (works on 2 MI300X, unvalidated)."
+echo "  - *bidir* configs (5B 720p AND 14B 480p) require flash-attn-4 (SM90/Hopper);"
+echo "    CUDA-only. The 14B *few-step* config is verified working (see above)."
 echo "  - Real-time WebRTC service at 24 FPS: built around CUDA latency tuning; expect misses on ROCm."
 echo "==================================================================="
