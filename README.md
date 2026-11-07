@@ -371,6 +371,61 @@ production. Use `torch_compile.enabled=true` (P1's ~1.27× on bidir). Re-run
 with a `torch>=2.11` ROCm image to re-test, or look at a vendor-native
 `rccl`/`qut` FP8 kernel that skips torchao's Python fallback entirely.
 
+## P3 (M1): chunk-streaming decode — first frame available in ~0.6 s
+
+The real-time story starts with the *few-step chunk-AR* path, whose AR loop
+commits latents chunk by chunk (chunk_size=3 latent frames = 12 pixel frames
+each in the 720p config). Until M1, even that path decoded the **entire**
+latent sequence into pixels only at the very end — no interactivity.
+
+**M1 change (additive, default-off):**
+- `ChunkCausalGenerationManager.generate(...)` gains an `on_chunk_ready`
+  callback, fired after every chunk commit (no behaviour change when the
+  callback is `None`).
+- `edenlive/inference/streaming.py` — `ChunkedVAEDecoder`: on each callback
+  it re-decodes just the chunk **plus a 2-latent causal look-back prefix**
+  (the Wan decoder is causal in time; without the look-back the per-chunk
+  boundaries are garbage) and keeps only the new frames.
+- `ChunkCausalStrategy` wires it up when `inference.streaming.enabled=true`
+  and records per-chunk decode timing + first-frame latency in the generation
+  metadata; `offline.py` dumps it to `streaming_stats.json`.
+
+**Measured on MI300X (5B few-step, 720p, 717 frames = 60 chunks):**
+
+| metric | value |
+|---|---|
+| first chunk decoded & frames available | **0.63 s after the 1st DiT chunk (~2 s) commit** |
+| steady-state per-chunk decode (12 frames, 720p) | **~1.19 s** |
+| total streamed frames | 717 (all chunks, no gaps) |
+| end-to-end exit | 0, video content identical to non-streaming run |
+
+Decode cost ~1.19 s per 12-frame chunk vs ~2 s DiT per chunk → **the decoder
+is no longer the bottleneck**, and the *user-visible* first frame now takes
+~2.6 s (1 DiT chunk + its decode) instead of ~124 s (full generation + full
+decode). That is the floor below which only DiT speedups (L2/L3 below) can
+push.
+
+Enable:
+```bash
+... --config edenlive/configs/wan22_5b_720p_few_step.yaml \
+    inference.streaming.enabled=true \
+    inference.streaming.lookback_latency=2
+```
+
+**Correctness basis** (`rocm/m1_vae_chunk_probe.py`, real 5B VAE on MI300X):
+window-style per-chunk decode (2-latent look-back) reproduces the full
+decode with **3.4-3.8% rel. diff / max 0.73 on a bf16 96×96 25-frame clip —
+visually a non-event in a preview/interactive context**; frame counts match
+exactly (25/25). Naive per-chunk decode (no look-back) is wrong at every
+boundary (46-90% rel. diff) — do not ship it.
+
+**Remaining for full real-time (P3 M2/M3, not built yet):**
+- M2: WebSocket JPEG frame server feeding a browser (the hook already yields
+  per-chunk pixel tensors; `make_on_chunk_ready` shows the pattern).
+- M3: `aiortc` WebRTC; 24 FPS at 720p is **not reachable on MI300X today**
+  (DiT chunk ~2 s = ~6 FPS at 12 frames/chunk) — needs the LightX2V-class
+  kernel stack the paper uses on H100; 480p chunk AR is the realistic target.
+
 ## What would be needed to go faster on MI300X (future, out of scope)
 
 - LightX2V-equivalent ROCm kernels + CUDA-Graph-equivalent (rocprof-comgr
