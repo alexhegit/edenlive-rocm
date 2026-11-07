@@ -310,13 +310,75 @@ compile (per-frame std ~0.26–0.27, non-flat).
 The ~5× of the H100 paper still needs the LightX2V stack (CUDA-graphs +
 fused + quant); inductor is the available ~1.3×.
 
+## P2 trial: W8A8/FP8 quantization via torchao — measured, mixed
+
+`pip install torchao` (0.18.0) on the `pytorch/rocm:rocm7.2.4` container
+**skips its cpp extensions** because they require `torch >= 2.11` (we have
+2.10.0). So torchao runs on the pure-Python fallback path.
+
+**Isolated GEMM microbench** (`rocm/p2_ao_bench.py`, 5B DiT MLP shape
+`4096→14336`, H100-style K=2048):
+
+| recipe | ms/GEMM | vs bf16 (0.136 ms) | cosine |
+|---|---|---|---|
+| bf16 (anchor) | 0.136 | 1.00× | — |
+| Float8DynamicActivationFloat8Weight (eager) | 0.110 | **1.23×** | 0.99929 |
+| Float8DynamicActivationFloat8Weight (+inductor) | 0.083 | **1.64×** | 0.99932 |
+| Int8WeightOnly (eager) | 0.175 | 0.78× | 0.99983 |
+| Int8WeightOnly (+inductor) | 0.162 | 0.84× | 0.99979 |
+| Int8DynamicActivationInt8Weight (eager) | 0.839 | 0.16× | 0.99884 |
+| Int8DynamicActivationInt8Weight (+inductor) | 0.324 | 0.42× | 0.99885 |
+
+Takeaway: **native FP8 (CDNA3) is the working recipe**; torchao's int8 fast
+path is not connected in this build (cpp ext skipped) and is either flat or a
+regression.
+
+**End-to-end, the win does not materialize.** 5B bidir @ 720p, 2 samples:
+
+| Config | sample 2 |
+|---|---|
+| bf16 eager (P0) | ~216 s |
+| bf16 + `torch_compile` (P1) | ~170 s |
+| **fp8_w8a8 + `torch_compile` (P2)** | **~219 s** |
+
+Reason: the per-layer dynamic FP8 activation quant/dequant work happens in
+Python under the fallback path, and its per-layer overhead is larger than the
+GEMM saving. The microbench is honest (it only measures the GEMM), but
+end-to-end the VAE decode + libx264 + Python-side quant wrappers dominate.
+This is the expected outcome for torchao-on-<torch-2.11; we keep the plugin
+so it can be re-enabled the moment a `torch >= 2.11` ROCm container lands.
+
+**What we still ship** (no behavior change unless explicitly turned on):
+- `edenlive/runtime/quantization.py` — `AOQuantizePlugin`, a
+  `runtime.ao_quantize.*` surface: `enabled`, `recipe` (`fp8_w8a8` |
+  `int8_w8a8` | `int8_weight_only` | `int4_weight_only`),
+  `transformer_only` (default true: only the DiT, not VAE/text encoder).
+- Registration in `edenlive/runtime/__init__.py` and added to the
+  `runtimes` tuple of the Wan22DiffusersAdapter.
+- Ordering: `ao_quantize` prepares **before** `torch_compile`, so the
+  inductor graph already contains the 8-bit GEMM ops (same order as
+  training; see `edenlive/inference/offline.py`).
+- Enable with:
+  `runtime.ao_quantize.enabled=true runtime.ao_quantize.recipe=fp8_w8a8`
+  (optional alongside `runtime.torch_compile.enabled=true`).
+
+Content check after quantization is identical in spirit to P1: 121 f @
+1280×704, per-frame std ~0.26–0.27, non-flat, motion present in both
+samples (2 exit 0).
+
+**Practical recommendation today:** do **not** enable `ao_quantize` for
+production. Use `torch_compile.enabled=true` (P1's ~1.27× on bidir). Re-run
+with a `torch>=2.11` ROCm image to re-test, or look at a vendor-native
+`rccl`/`qut` FP8 kernel that skips torchao's Python fallback entirely.
+
 ## What would be needed to go faster on MI300X (future, out of scope)
 
 - LightX2V-equivalent ROCm kernels + CUDA-Graph-equivalent (rocprof-comgr
   graphs) for the DiT — this is the ~5× that the paper gets on H100.
-- bf16 → fp8 quantization of the DiT (H100 supports native FP8; MI300X
-  has ROCm FP8 via `--fp8` / `qut`-style kernels but they aren't wired
-  into this codebase).
+- A ROCm `pytorch/rocm:torch-rocm-2.11+` style image so that
+  `pip install torchao` compiles its fast cpp kernels — that is the path
+  where FP8 W8A8 (the 1.64× microbench result here) can actually pay off
+  end-to-end, instead of running on the pure-Python fallback.
 - Sequence-parallel across 2 MI300X for the 14B bidir config — the config
   file is already correct, but the FA4 path in bidir is the blocker; would
   need a Triton/ROCm flash-attention replacement for the bidir kernel.
