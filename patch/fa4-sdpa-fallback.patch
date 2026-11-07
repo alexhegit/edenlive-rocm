@@ -1,0 +1,342 @@
+diff --git a/edenlive/models/adapters/wan22_diffusers/dynamic_prompt.py b/edenlive/models/adapters/wan22_diffusers/dynamic_prompt.py
+index 9007de5..7ae7fac 100644
+--- a/edenlive/models/adapters/wan22_diffusers/dynamic_prompt.py
++++ b/edenlive/models/adapters/wan22_diffusers/dynamic_prompt.py
+@@ -1,11 +1,28 @@
+-"""Wan bidirectional temporal text: explicit layouts, no mutable processor state."""
++"""Wan bidirectional temporal text: explicit layouts, no mutable processor state.
+ 
++Backends:
++
++- ``flash4`` — reference implementation: FA4 CuTe varlen kernel for
++  per-frame-block cross-attention. Requires Hopper (SM90) + the
++  ``flash-attn-4==4.0.0b31`` + ``nvidia-cutlass-dsl`` wheels.
++- SDPA fallback — automatic when the FA4 kernel is not importable (e.g.
++  ROCm / MI300X): the same per-frame-block mapping implemented as a tight
++  block loop over ``torch.nn.functional.scaled_dot_product_attention``.
++
++Both backends consume and produce the exact same tensor layout, so the
++call site in ``wan_ops`` is unchanged.
++"""
+ from __future__ import annotations
+ 
+ import bisect
+-from importlib.metadata import version
+ 
+ from edenlive.core.text_timeline import clip_text_timeline
++from edenlive.models.adapters.wan22_diffusers.teacher_forcing_attention import (
++    _detect_fa4_kernel,
++)
++from edenlive.utils import get_logger
++
++logger = get_logger(__name__)
+ 
+ 
+ def validate_config(config, variant):
+@@ -13,18 +30,52 @@ def validate_config(config, variant):
+         return
+     if variant != "5b":
+         raise ValueError("dynamic_prompt currently supports Wan 2.2 5B only")
+-    if config["backend"] != "flash4":
++    # 'flash4' is the reference kernel name; on ROCm the same string
++    # transparently dispatches to the SDPA fallback below.
++    if config.get("backend", "flash4") != "flash4":
+         raise ValueError("The reference dynamic prompt profile requires flash4")
+ 
+ 
+ def validate_environment(device, dtype):
+-    from .teacher_forcing_attention import validate_flash4_environment
++    """Allow-load check.
+ 
+-    validate_flash4_environment(device, dtype)
+-    # Match the package used by the reference profile.
+-    if version("flash-attn-4") != "4.0.0b31":
+-        raise RuntimeError("dynamic_prompt flash4 requires flash-attn-4==4.0.0b31")
+-    from . import flash4_varlen  # noqa: F401
++    On CUDA this keeps the original strict gate (a silently-downgraded
++    kernel would change validated Hopper behaviour).  On non-CUDA (ROCm)
++    the FA4 wheel is simply absent; we log the fallback intent instead of
++    raising so the model can still load and run.
++    """
++    import torch
++    from packaging.version import Version
++
++    if torch.version.hip is not None or not (
++        torch.device(device).type == "cuda" and torch.cuda.is_available()
++    ):
++        logger.info_rank0(
++            "dynamic_prompt: FA4 kernel unavailable (%s) -- SDPA "
++            "fallback will be used for per-frame-block cross-attention.",
++            "ROCm/CDNA" if torch.version.hip is not None else torch.device(device),
++        )
++        return
++    # CUDA: keep the original hard gates.
++    from importlib.metadata import PackageNotFoundError, version as _pkg_version
++
++    if Version(torch.__version__.split("+")[0]) < Version("2.11"):
++        raise RuntimeError("Wan flash4 requires PyTorch >=2.11; tested with 2.11.0+cu128")
++    if torch.cuda.get_device_capability(device) != (9, 0):
++        raise RuntimeError("This Wan flash4 integration currently targets SM90 (Hopper); other GPUs are unvalidated")
++    if dtype != torch.bfloat16:
++        raise ValueError("This Wan flash4 integration requires BF16 compute")
++    if not _detect_fa4_kernel():
++        raise RuntimeError(
++            "Cannot import FA4. Install requirements/wan22-fa4.txt in the training environment."
++        )
++    try:
++        if _pkg_version("flash-attn-4") != "4.0.0b31":
++            raise RuntimeError("dynamic_prompt flash4 requires flash-attn-4==4.0.0b31")
++    except (ImportError, OSError, PackageNotFoundError) as exc:
++        raise RuntimeError(
++            "dynamic_prompt flash4 requires flash-attn-4==4.0.0b31 and nvidia-cutlass-dsl"
++        ) from exc
+ 
+ 
+ def frame_lengths(timeline, num_latent_frames: int) -> tuple[int, ...]:
+@@ -40,7 +91,7 @@ def frame_lengths(timeline, num_latent_frames: int) -> tuple[int, ...]:
+             f"text timeline has {timeline['num_frames']} decoded frames; Wan input requires {expected}"
+         )
+     # The latent at t covers the causal VAE interval ending at t. An exact
+-    # caption boundary belongs to the segment on its left; frame zero is first.
++    # caption boundary belongs to the segment on the left; frame zero is first.
+     ends = [s["end_sec"] for s in timeline["segments"]]
+     counts = [0] * len(ends)
+     for i in range(num_latent_frames):
+@@ -79,6 +130,37 @@ def build_layout(timelines, *, latent_shape, patch_size, text_length, device):
+     )
+ 
+ 
++def _sdpa_block_attention(q_flat, packed_k, packed_v, cu_q, text_length):
++    """Per-frame-block cross-attention via SDPA (the ROCm fallback path).
++
++    Layout contract (matches ``build_layout``):
++    - ``q_flat`` / ``packed_k`` / ``packed_v``: ``[T, H, D]`` flat tokens;
++      K tokens for block ``j`` live at ``[j*L, (j+1)*L)`` with
++      ``L = text_length``.
++    - ``cu_q``: ``[B+1]`` cumulative offsets; query tokens for block ``j``
++      live at ``[cu_q[j], cu_q[j+1])``.
++    - For batch 1 (the only supported case) K/V are packed contiguously
++      across frame blocks, so token ``t`` of the j-th query block attends
++      to K/V of its corresponding text segment — the same mapping the
++      FA4 varlen kernel produces with ``cu_k = j*L``.
++    """
++    import torch
++    import torch.nn.functional as F
++
++    cu = [int(x) for x in cu_q.tolist()]
++    out = torch.empty_like(q_flat)
++    for j in range(len(cu) - 1):
++        a, b = cu[j], cu[j + 1]
++        if b <= a:
++            continue
++        kj0, kj1 = j * text_length, (j + 1) * text_length
++        qj = q_flat[a:b].transpose(0, 1)      # [H, n, D]
++        kj = packed_k[kj0:kj1].transpose(0, 1)
++        vj = packed_v[kj0:kj1].transpose(0, 1)
++        out[a:b] = F.scaled_dot_product_attention(qj, kj, vj).transpose(0, 1)
++    return out
++
++
+ def cross_attention(attn, hidden_states, encoder_hidden_states, layout):
+     import torch
+     from diffusers.models.transformers.transformer_wan import _get_qkv_projections
+@@ -90,7 +172,6 @@ def cross_attention(attn, hidden_states, encoder_hidden_states, layout):
+     k = attn.norm_k(k).unflatten(2, (attn.heads, -1))
+     v = v.unflatten(2, (attn.heads, -1))
+     lengths, text_length = layout["lengths"], layout["text_length"]
+-    from .flash4_varlen import varlen_fwd
+ 
+     # Discard per-sample padding between prompt banks before the varlen call.
+     packed_k = torch.cat(
+@@ -99,15 +180,26 @@ def cross_attention(attn, hidden_states, encoder_hidden_states, layout):
+     packed_v = torch.cat(
+         [v[i, : len(sample) * text_length] for i, sample in enumerate(lengths)]
+     )
+-    out, _ = varlen_fwd(
+-        q.flatten(0, 1),
+-        packed_k,
+-        packed_v,
+-        layout["cu_q"],
+-        layout["cu_k"],
+-        layout["max_q"],
+-        text_length,
+-    )
++
++    if _detect_fa4_kernel():
++        from .flash4_varlen import varlen_fwd
++
++        out, _ = varlen_fwd(
++            q.flatten(0, 1),
++            packed_k,
++            packed_v,
++            layout["cu_q"],
++            layout["cu_k"],
++            layout["max_q"],
++            text_length,
++        )
++    else:
++        # ROCm / other platforms without the FA4 CuTe kernel:
++        # per-frame-block SDPA.  Same contract in and out.
++        out = _sdpa_block_attention(
++            q.flatten(0, 1), packed_k, packed_v, layout["cu_q"], text_length
++        )
++
+     out = out.reshape_as(q)
+     out = out.flatten(2, 3).type_as(q)
+     return attn.to_out[1](attn.to_out[0](out))
+diff --git a/edenlive/models/adapters/wan22_diffusers/teacher_forcing_attention.py b/edenlive/models/adapters/wan22_diffusers/teacher_forcing_attention.py
+index 3bced09..1bdef98 100644
+--- a/edenlive/models/adapters/wan22_diffusers/teacher_forcing_attention.py
++++ b/edenlive/models/adapters/wan22_diffusers/teacher_forcing_attention.py
+@@ -9,53 +9,129 @@ logger = get_logger(__name__)
+ 
+ 
+ def validate_backend_name(backend: str) -> None:
+-    if backend not in ("triton", "flash4"):
+-        raise ValueError("model.teacher_forcing_attention_backend must be 'triton' or 'flash4'")
++    if backend not in ("triton", "sdpa", "flash4"):
++        raise ValueError(
++            "model.teacher_forcing_attention_backend must be 'triton', 'sdpa', or 'flash4'"
++        )
++    if backend in ("triton", "sdpa"):
++        # Both names select the native PyTorch path (dispatch_attention_fn with
++        # backend=None -> F.scaled_dot_product_attention). 'sdpa' is the
++        # explicit, cross-platform spelling; 'triton' is kept for config
++        # compatibility. Neither requires a CUDA-only flash-extension.
++        try:
++            import torch
+ 
++            if not torch.__version__:  # pragma: no cover
++                raise ImportError("torch not available")
++        except ImportError as exc:  # pragma: no cover
++            raise RuntimeError(f"teacher-forcing backend '{backend}' requires PyTorch") from exc
+ 
+-def validate_flash4_environment(device, dtype) -> None:
+-    """Fail before loading weights, rather than silently selecting a different kernel."""
++
++FA4_KERNEL_AVAILABLE: bool | None = None  # lazily detected, cached per process
++
++
++def _detect_fa4_kernel() -> bool:
++    """True when the official FA4 CuTe kernel is importable on this platform."""
++    global FA4_KERNEL_AVAILABLE
++    if FA4_KERNEL_AVAILABLE is None:
++        try:
++            import importlib.util
++
++            ok = importlib.util.find_spec("flash_attn") is not None
++            if ok:
++                import flash_attn.cute  # noqa: F401
++        except Exception:
++            ok = False
++        FA4_KERNEL_AVAILABLE = ok
++    return FA4_KERNEL_AVAILABLE
++
++
++def validate_flash4_environment(device, dtype) -> bool:
++    """Validate the FA4 environment; report (never raise) when we should fall back.
++
++    Returns True when the real FA4 CuTe kernel must be used, False when the
++    SDPA fallback should take over.  On CUDA we keep the original strict
++    checks (torch>=2.11, SM90, BF16, exact FA4/CuTe wheel versions) because a
++    silently-downgraded kernel there would change validated behaviour.  On
++    non-CUDA (e.g. ROCm) the FA4 wheel is simply absent, so we fall back.
++    """
+     import torch
+     from packaging.version import Version
+ 
++    is_hip = torch.version.hip is not None
++    if not (torch.device(device).type == "cuda" and torch.cuda.is_available()) or is_hip:
++        logger.info_rank0(
++            "Wan flash4 unavailable (%s) -- using SDPA fallback "
++            "for teacher-forcing self-attention.",
++            "ROCm/CDNA" if is_hip else torch.device(device),
++        )
++        return False
++
++    # CUDA: strict checks first (identical to the original hard gate).
+     if Version(torch.__version__.split("+")[0]) < Version("2.11"):
+         raise RuntimeError("Wan flash4 requires PyTorch >=2.11; tested with 2.11.0+cu128")
+-    if torch.device(device).type != "cuda" or not torch.cuda.is_available():
+-        raise RuntimeError("Wan flash4 requires a CUDA GPU")
+     if torch.cuda.get_device_capability(device) != (9, 0):
+         raise RuntimeError("This Wan flash4 integration currently targets SM90 (Hopper); other GPUs are unvalidated")
+     if dtype != torch.bfloat16:
+         raise ValueError("This Wan flash4 integration requires BF16 compute")
++    if not _detect_fa4_kernel():
++        raise RuntimeError(
++            "Cannot import FA4 on this CUDA platform. Install requirements/wan22-fa4.txt "
++            "in the training environment. An older flash-attn (FA2) extension built for a "
++            "different torch can also break this import."
++        )
+     try:
+         versions = {name: version(name) for name in ("flash-attn-4", "nvidia-cutlass-dsl", "triton")}
+-        import flash_attn.cute  # noqa: F401
++        if versions["flash-attn-4"] != "4.0.0b31":
++            raise RuntimeError(f"Wan flash4 requires flash-attn-4==4.0.0b31, got {versions['flash-attn-4']}")
+     except (ImportError, OSError, PackageNotFoundError) as exc:
+         raise RuntimeError(
+-            "Cannot import FA4. Install requirements/wan22-fa4.txt in the training environment. "
+-            "An older flash-attn (FA2) extension built for a different torch can also break this import."
++            "Cannot validate the FA4 environment (missing flash-attn-4 / nvidia-cutlass-dsl)."
+         ) from exc
+     logger.info_rank0(f"Wan teacher-forcing FA4: torch={torch.__version__}, cuda={torch.version.cuda}, {versions}")
++    return True
+ 
+ 
+ def flash4_attention(query, key, value):
+-    """Run an unmasked Wan self-attention with the official FA4 CuTe API.
++    """Bidir teacher-forcing self-attention: FA4 kernel when available, else SDPA.
++
++    Layout note: the official H100 reference calls ``flash_attn_func`` directly
++    on whatever tensor Wan passes and then reads the result back at
++    ``.flatten(2, 3)`` (``wan_ops.py:191``).  We preserve that exact
++    convention here so the FA4 path stays byte-for-byte identical to the
++    validated H100 reference — no transposes added on the FA4 branch.
+ 
+-    ``flash_attn``'s top-level FA2 symbols are intentionally not used here:
+-    the FA4 wheel exposes the implementation from ``flash_attn.cute``.  The
+-    CuTe function accepts Wan's ``[batch, sequence, heads, head_dim]`` layout
+-    and returns ``(output, lse)``; only the output belongs in the transformer
+-    residual stream.
++    On platforms without the FA4 CuTe wheel (e.g. ROCm) we fall back to
++    ``torch.nn.functional.scaled_dot_product_attention``.  Because the FA4
++    convention was verified against a working H100 config and the SDPA
++    convention is independently verified in tests, and because both consume
++    / return ``[B, S, H, D]`` for the caller to ``.flatten(2, 3)`` into
++    ``[B, S, H*D]``, the call site is unchanged.
+     """
++    if _detect_fa4_kernel():
++        from flash_attn.cute import flash_attn_func
++
++        output, _lse = flash_attn_func(
++            q=query,
++            k=key,
++            v=value,
++            causal=False,
++        )
++        return output
+ 
+-    from flash_attn.cute import flash_attn_func
++    import torch.nn.functional as F
+ 
+-    output, _lse = flash_attn_func(
+-        q=query,
+-        k=key,
+-        v=value,
+-        causal=False,
++    # No FA4 wheel here (ROCm or similar).  Use native SDPA.  Wan passes
++    # ``[B, S, H, D]`` which is what SDPA's callers expect in the
++    # ``.flatten(2, 3)`` contract on the caller side; transpose to
++    # ``[B, H, S, D]`` for the math and transpose back.
++    out = F.scaled_dot_product_attention(
++        query.transpose(1, 2),
++        key.transpose(1, 2),
++        value.transpose(1, 2),
++        is_causal=False,
+     )
+-    return output
++    return out.transpose(1, 2)
+ 
+ 
+ def configure_teacher_forcing_attention(transformer, backend: str) -> None:

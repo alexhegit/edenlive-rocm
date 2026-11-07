@@ -1,9 +1,40 @@
 # EdenLive on AMD ROCm (MI300X / gfx90a)
 
-Ported and **verified running** 2026-11-05 on the 5B model, offline
-few-step (chunk-autoregressive) inference path.
+Ported and **verified running** 2026-11-05 (few-step) and 2026-11-06
+(bidir, after the `flash4 → SDPA` fallback port) on 5B + 14B models,
+offline inference.
 
 ## What works on MI300X
+
+### 5B — `wan22_5b_720p_bidir.yaml` (Wan2.2-TI2V-5B @ 720p, **full-quality bidirectional**) ✅ verified 2026-11-06
+
+1280×704, **121 frames, 48 steps, `flow_unipc`, bidirectional denoising** —
+the "quality" path that was CUDA-gated by `flash4`. Now runs on MI300X
+via the SDPA fallback (see `## Code changes for the bidir port` below):
+
+- `teacher_forcing_attention_backend: flash4` → auto-falls back to
+  `F.scaled_dot_product_attention` (numerically equivalent unmasked
+  self-attention; verified against a naive reference, max err 0.0) ✅
+- `dynamic_prompt: enabled` (per-frame-block text conditioning) →
+  FA4 varlen kernel replaced by a per-block SDPA loop
+  (`_sdpa_block_attention`) ✅
+- 2× sample generate + VAE decode + libx264 encode ~ **3-4 min per
+  121-frame clip end-to-end** (~0.6 FPS; the 48-step bidir schedule is
+  ~12× more model-fwd than 4-step few-step, so this is expected) ✅
+- `PYTHON_EXIT=0`, content verified non-flat (per-frame std 0.23-0.28,
+  channel stds 0.20-0.29, inter-frame diff 0.05-0.26) ✅
+- Requires the extra weight dir `dit-5b-bidir/` (~19 GB) on top of the
+  few-step set.
+
+### 14B — `wan21_14b_480p_bidir.yaml` (Wan2.1-I2V-14B @ 480p, bidirectional) ✅ verified 2026-11-06
+
+832×480, 81 frames, 40 steps, `flow_unipc` — the 14B "quality" path.
+Uses `teacher_forcing_attention_backend: triton` (native SDPA, no `flash4`
+dependency) and `dynamic_prompt.enabled: false`, so it needs **no fallback**
+— plain single-card run, same overrides as the 14B few-step config. Both
+samples completed `PYTHON_EXIT=0` with real content (frame std 0.27,
+per-channel 0.23–0.29, inter-frame diffs 0.04–0.24), ~7.5 min end-to-end
+per 81-frame clip. Requires `dit-14b-bidir/` (~64 GB).
 
 ### 5B — `wan22_5b_720p_few_step.yaml` (Wan2.2-TI2V-5B @ 720p)
 
@@ -59,13 +90,12 @@ Measured throughput ≈ 717 frames / 115 s ≈ **6.2 FPS** end-to-end
 
 | Component | Why |
 |---|---|
-| `wan22_5b_720p_bidir.yaml` | `teacher_forcing_attention_backend: flash4` → `flash-attn-4==4.0.0b31` (CuTe, SM90/Hopper only). `validate_flash4_environment` explicitly requires `torch.cuda.get_device_capability == (9, 0)`. gfx90a is (9,0) **in a different axis** but the wheel isn't built for ROCm. |
-| `wan21_14b_480p_bidir` | Same FA4 requirement as the 5B bidir config. (The 14B **few-step** config does NOT need FA4 and was verified working on one MI300X — see table above.) |
-| `realtime/` WebRTC service | `flashdreams`/`apps/cam2v` + LightX2V accelerated decode — no ROCm path. |
+| `realtime/` WebRTC service (24 FPS target) | `flashdreams`/`apps/cam2v` + LightX2V accelerated decode stack — no ROCm equivalent. The 5× real-time margin in the paper comes from CUDA graphs + fused kernels + quant; that whole stack is NVIDIA-only. |
 | `reactor/` (B200) | Runs on 1× B200 by design. |
 | `flux-c2f/` first-frame renderer | FLUX.2 non-commercial, workbench-only. Irrelevant for offline rendering. |
 
-For ROCm use, the **5B few-step** config is the validated target.
+Both `*bidir*` configs **now work** via the fallbacks described above;
+what remains gated is the *real-time speed*, not the functionality.
 
 ## Files added
 
@@ -186,6 +216,69 @@ switch. Outputs → `inference/wan21_14b_480p_few_step/save/inference/base/<id>.
    filesystem before running a big job (one-liner in the container:
    `ls models/EdenLive/<path>` for each line of the config's
    `components:` block).
+
+## Code changes for the bidir port (P0)
+
+Two files in `edenlive/models/adapters/wan22_diffusers/`:
+
+1. `teacher_forcing_attention.py`
+   - `validate_flash4_environment(device, dtype)` now **returns** `True/False`
+     instead of raising: ROCm (`torch.version.hip` is not None) or any
+     non-CUDA platform returns `False` (fallback intent); CUDA+Hopper keeps
+     the original strict gates (SM90, BF16, FA4 version check) so validated
+     H100 behaviour is unchanged.
+   - New `_detect_fa4_kernel()` — lazy, cached check for whether the CuTe
+     FA4 wheel is importable on this platform.
+   - `flash4_attention(q,k,v)` dispatches: FA4 kernel when
+     `_detect_fa4_kernel()` is true, else a numerically-equivalent
+     `F.scaled_dot_product_attention` path (unmasked self-attention). The
+     caller (`wan_ops.py:166-191`) is unchanged.
+
+2. `dynamic_prompt.py`
+   - `cross_attention(...)` dispatches the same way: FA4 varlen kernel when
+     available, else `_sdpa_block_attention` — a tight per-frame-block SDPA
+     loop that reproduces the `dynamic_prompt` contract (each query block
+     attends to its corresponding text segment K/V window `text_length`
+     wide). The `cu_q` / `lengths` / `text_length` contract the FA4 kernel
+     was using is preserved; a naive reference implementation reproduces it
+     to `max err 0.0` on a toy 2×5×7 layout (see `rocm/test_sdpa_fallback.py`).
+   - `validate_environment(device, dtype)` no longer raises on ROCm; it
+     logs the fallback intent and returns, so the 5B bidir config loads
+     cleanly.
+
+Test / reproduction:
+
+- `rocm/test_sdpa_fallback.py` — pure-attention SDPA fallback numerical
+  check vs. a masked reference (passes).
+- `rocm/check_bidir_video.py` — inspect a bidir output clip (frame/std/
+  channel/inter-frame diffs) to confirm the model produced real content,
+  not flat frames.
+
+```bash
+# 5B bidir (720p, 121 frames, 48 steps) — ~3-4 min per sample on MI300X
+docker exec -e HIP_VISIBLE_DEVICES=0 edenlive-rocm bash -lc "
+  cd /mnt/doscratch/EdenLive && \
+  python -X faulthandler -u -m edenlive.scripts.infer \
+    --config edenlive/configs/wan22_5b_720p_bidir.yaml \
+    data.dataset.params.path=examples/samples/manifest.csv \
+    data.dataset.params.root=examples/samples"
+
+# 14B bidir (480p, 81 frames, 40 steps) — ~7.5 min per sample on MI300X
+docker exec -e HIP_VISIBLE_DEVICES=0 -e DIFFUSERS_ATTN_BACKEND=_native_flash edenlive-rocm bash -lc "
+  cd /mnt/doscratch/EdenLive && \
+  python -X faulthandler -u -m edenlive.scripts.infer \
+    --config edenlive/configs/wan21_14b_480p_bidir.yaml \
+    data.dataset.params.path=examples/samples/manifest.csv \
+    data.dataset.params.root=examples/samples \
+    inference.max_batches=1 \
+    runtime.fsdp2.enabled=false \
+    runtime.sequence_parallel.size=1"
+```
+
+Both `*bidir*` runs need the extra per-model bidir weight dirs (`dit-5b-bidir/`
+~19 GB, `dit-14b-bidir/` ~64 GB) which are separate from the few-step dirs.
+`hf download VAST-AI/EdenLive --include 'dit-<size>-bidir/*' --local-dir <repo>/models/EdenLive`
+(one `--include` per call — see pitfalls §1 above).
 
 ## What would be needed to go faster on MI300X (future, out of scope)
 
