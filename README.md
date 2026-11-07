@@ -280,6 +280,36 @@ Both `*bidir*` runs need the extra per-model bidir weight dirs (`dit-5b-bidir/`
 `hf download VAST-AI/EdenLive --include 'dit-<size>-bidir/*' --local-dir <repo>/models/EdenLive`
 (one `--include` per call — see pitfalls §1 above).
 
+## P1 speedup trial: torch.compile (inductor) on MI300X — measured, honest
+
+Inductor **does** compile and run the DiT here (verified with a standalone
+smoke test, `rocm/p1_inductor_smoke.py`, before committing to full runs —
+that de-risked the path). Results for 5B @ 720p:
+
+| Path | baseline (eager) | `runtime.torch_compile.enabled=true` | speedup |
+|---|---|---|---|
+| **bidir** (121 f, 48 steps, no cache, full-SDPA) | ~216 s / sample (sample 2) | ~170 s / sample (sample 2) | **~1.27×** |
+| **few-step** (717 f, 4 steps, cache-chunk-AR) | ~115–150 s | ~124 s | **~1.0× (flat)** |
+
+Why the split: the bidir pass is unmasked full-attention with no per-step
+KV-cache shape churn, so inductor can fuse it; the few-step chunk-AR pass
+has dynamic KV-cache shapes that fragment the compile graph, so it gains
+little. A single isolated attention block measures ~1.46× under inductor —
+that's the pure-attention ceiling, and end-to-end is diluted by VAE decode
++ libx264 (uncompiled, fixed cost) and the cache path.
+
+Turn it on (no code change; the repo already ships the `TorchCompilePlugin`):
+```bash
+... --config edenlive/configs/wan22_5b_720p_bidir.yaml \
+    runtime.torch_compile.enabled=true inference.output_dir=<dir-with-compile>
+```
+First sample pays the compile wall (~30–60 s once per process; cached to
+`~/.cache/torchinductor_root` after that). Both paths content-verified after
+compile (per-frame std ~0.26–0.27, non-flat).
+
+The ~5× of the H100 paper still needs the LightX2V stack (CUDA-graphs +
+fused + quant); inductor is the available ~1.3×.
+
 ## What would be needed to go faster on MI300X (future, out of scope)
 
 - LightX2V-equivalent ROCm kernels + CUDA-Graph-equivalent (rocprof-comgr
